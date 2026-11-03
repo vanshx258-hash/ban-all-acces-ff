@@ -6,7 +6,6 @@ import logging
 import requests
 import qrcode
 from io import BytesIO
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputFile
@@ -19,6 +18,7 @@ PORT = int(os.environ.get("PORT", 10000))
 BAN_API = "https://jexarcodexacstoban.vercel.app/close?access_token="
 API_KEY = "ANIXH"
 
+# States for Conversations
 (ASK_TOKEN, ASK_UPI, ASK_PRICE, ASK_WELCOME, ASK_GIFT_ID, ASK_TRAILS, BCAST_TEXT) = range(7)
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -71,29 +71,42 @@ def get_setting(key, default=None):
 def set_setting(key, value):
     db_execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, str(value)))
 
-# ================== MAIN MENU ==================
+# ================== KEYBOARDS ==================
+def get_main_keyboard(user_id):
+    kb = [
+        [KeyboardButton(st("BAN ACCOUNT")), KeyboardButton(st("SUPPORT"))],
+        [KeyboardButton(st("GET PREMIUM"))]
+    ]
+    if user_id == OWNER_ID:
+        kb.append([KeyboardButton(st("OWNER PANEL"))])
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+def get_owner_keyboard():
+    kb = [
+        [KeyboardButton(st("SET UPI")), KeyboardButton(st("SET PRICE"))],
+        [KeyboardButton(st("SET WELCOME")), KeyboardButton(st("GIFT PREMIUM"))],
+        [KeyboardButton(st("SET TRAILS")), KeyboardButton(st("BROADCAST"))],
+        [KeyboardButton(st("STATS")), KeyboardButton(st("MAIN MENU"))]
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+# ================== START & MAIN MENU ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db_execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user.id,))
     
     welcome_img = get_setting("welcome_image")
-    caption = f"{st('Welcome')} {user.first_name}!\n\n{st('Select an option')}"
-    
-    kb = [
-        [KeyboardButton(st("BAN ACCOUNT")), KeyboardButton(st("SUPPORT"))],
-        [KeyboardButton(st("GET PREMIUM"))]
-    ]
-    if user.id == OWNER_ID:
-        kb.append([KeyboardButton(st("OWNER PANEL"))])
-    
-    reply_markup = ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    caption = f"{st('Welcome')} {user.first_name}!\n\n{st('Select an option from menu')}"
     
     if welcome_img:
         try:
-            await update.message.reply_photo(photo=welcome_img, caption=caption, reply_markup=reply_markup, parse_mode="HTML")
+            await update.message.reply_photo(photo=welcome_img, caption=caption, reply_markup=get_main_keyboard(user.id))
             return
         except: pass
-    await update.message.reply_text(caption, reply_markup=reply_markup, parse_mode="HTML")
+    await update.message.reply_text(caption, reply_markup=get_main_keyboard(user.id))
+
+async def main_menu_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
 
 # ================== BAN ACCOUNT ==================
 async def ban_account_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,8 +115,7 @@ async def ban_account_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_premium, trails = user_data
     
     if is_premium == 0 and trails <= 0:
-        return await update.message.reply_text(st("You have 0 free trails left. Please buy premium."), 
-                                               reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(st("GET PREMIUM"), callback_data="premium", style="success")]]))
+        return await update.message.reply_text(st("You have 0 free trails left. Please buy premium."))
                                                
     if is_premium == 0:
         db_execute("UPDATE users SET trails = trails - 1 WHERE user_id=?", (user_id,))
@@ -125,26 +137,21 @@ async def process_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uid = data.get("uid", "Unknown")
             level = data.get("level", "N/A")
             
-            msg = (
-                f"<blockquote>ID Banned Successfully\n"
-                f"Name: {name}\n"
-                f"UID: {uid}\n"
-                f"Level: {level}</blockquote>"
-            )
+            msg = f"<blockquote>ID Banned Successfully\nName: {name}\nUID: {uid}\nLevel: {level}</blockquote>"
             await update.message.reply_text(msg, parse_mode="HTML")
         else:
             await update.message.reply_text("<blockquote>Ban Failed: Invalid Access Token</blockquote>", parse_mode="HTML")
-    except Exception as e:
+    except Exception:
         await update.message.reply_text("<blockquote>Ban Failed: Invalid Access Token</blockquote>", parse_mode="HTML")
     
     return ConversationHandler.END
 
-# ================== GET PREMIUM ==================
+# ================== GET PREMIUM & CANCEL ==================
 async def premium_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price = get_setting("premium_price", "19")
     upi = get_setting("upi_id", "vansh111@naviaxis")
-    
     user_id = update.effective_user.id
+    
     db_execute("INSERT INTO payments (user_id, amount, status) VALUES (?,?,?)", (user_id, float(price), "PENDING"))
     
     qr_data = f"upi://pay?pa={upi}&pn=Owner&am={price}&cu=INR"
@@ -160,110 +167,66 @@ async def premium_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{st('Waiting for payment...')}"
     )
     
-    await update.message.reply_photo(photo=InputFile(bio, filename="qr.png"), caption=caption, parse_mode="HTML")
-
-# ================== GROUP SMS READER ==================
-async def group_sms_reader(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if not text: return
+    # RED CANCEL BUTTON
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(st("CANCEL PAYMENT"), callback_data="cancel_payment", style="danger")]])
     
-    amt_match = re.search(r'(?:Rs\.?|INR)\s*([0-9]+(?:\.[0-9]{1,2})?)', text)
-    txn_match = re.search(r'Txn ID:\s*([A-Za-z0-9]+)', text)
-    
-    if amt_match and txn_match:
-        amount = float(amt_match.group(1))
-        txn_id = txn_match.group(1)
-        
-        pending = db_execute("SELECT id, user_id FROM payments WHERE status='PENDING' AND ABS(amount - ?) < 0.01", (amount,))
-        
-        if pending:
-            p_id, u_id = pending[0]
-            db_execute("UPDATE payments SET status='VERIFIED', txn_id=? WHERE id=?", (txn_id, p_id))
-            db_execute("UPDATE users SET is_premium=1 WHERE user_id=?", (u_id,))
-            
-            try:
-                await context.bot.send_message(chat_id=u_id, text=f"<b>{st('Payment Verified! Now you are a premium user, get unlimited access now.')}</b>", parse_mode="HTML")
-            except: pass
-            
-            await update.message.reply_text(f"Payment {amount} verified for user {u_id}.")
+    await update.message.reply_photo(photo=InputFile(bio, filename="qr.png"), caption=caption, reply_markup=kb, parse_mode="HTML")
 
-# ================== OWNER PANEL ==================
-async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_caption(caption=st("Payment Cancelled."), reply_markup=None)
+
+# ================== OWNER PANEL KEYBOARD ==================
+async def owner_panel_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID: return
-    kb = [
-        [InlineKeyboardButton(st("TOTAL USERS"), callback_data="stats", style="primary"), InlineKeyboardButton(st("PAYMENTS"), callback_data="paystats", style="primary")],
-        [InlineKeyboardButton(st("SET UPI ID"), callback_data="set_upi", style="primary"), InlineKeyboardButton(st("SET PRICE"), callback_data="set_price", style="primary")],
-        [InlineKeyboardButton(st("SET WELCOME IMAGE"), callback_data="set_welcome", style="primary")],
-        [InlineKeyboardButton(st("GIFT PREMIUM"), callback_data="gift_prem", style="success")],
-        [InlineKeyboardButton(st("BROADCAST"), callback_data="broadcast", style="danger")],
-        [InlineKeyboardButton(st("SET TRAILS"), callback_data="set_trails", style="danger")]
-    ]
-    await update.message.reply_text(f"<b>{st('OWNER PANEL')}</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    await update.message.reply_text(st("Owner Panel"), reply_markup=get_owner_keyboard())
 
-async def owner_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    data = query.data
-    
-    if data == "stats":
-        total = db_execute("SELECT COUNT(*) FROM users")[0][0]
-        prem = db_execute("SELECT COUNT(*) FROM users WHERE is_premium=1")[0][0]
-        await query.message.reply_text(f"{st('Total Users')}: {total}\n{st('Premium Users')}: {prem}")
-    elif data == "paystats":
-        pays = db_execute("SELECT amount, user_id, txn_id FROM payments WHERE status='VERIFIED'")
-        if not pays: return await query.message.reply_text(st("No payments yet."))
-        text = f"{st('Verified Payments')}:\n"
-        for p in pays: text += f"₹{p[0]} | User {p[1]} | Txn: {p[2]}\n"
-        await query.message.reply_text(text)
-    elif data == "set_upi":
-        await query.message.reply_text(st("Send new UPI ID:"))
-        return ASK_UPI
-    elif data == "set_price":
-        await query.message.reply_text(st("Send new Premium Price (numbers only):"))
-        return ASK_PRICE
-    elif data == "set_welcome":
-        await query.message.reply_text(st("Send Welcome Image:"))
-        return ASK_WELCOME
-    elif data == "gift_prem":
-        await query.message.reply_text(st("Send User ID to gift premium:"))
-        return ASK_GIFT_ID
-    elif data == "set_trails":
-        await query.message.reply_text(st("Send number of free trails:"))
-        return ASK_TRAILS
-    elif data == "broadcast":
-        await query.message.reply_text(st("Send the message/photo to broadcast:"))
-        return BCAST_TEXT
+async def owner_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total = db_execute("SELECT COUNT(*) FROM users")[0][0]
+    prem = db_execute("SELECT COUNT(*) FROM users WHERE is_premium=1")[0][0]
+    await update.message.reply_text(f"{st('Total Users')}: {total}\n{st('Premium Users')}: {prem}")
 
+# Owner Setup Flows
+async def ask_upi(update, context):
+    await update.message.reply_text(st("Send new UPI ID:")); return ASK_UPI
 async def save_upi(update, context):
-    set_setting("upi_id", update.message.text)
-    await update.message.reply_text(st("UPI Updated!"))
-    return ConversationHandler.END
+    set_setting("upi_id", update.message.text); await update.message.reply_text(st("UPI Updated!"), reply_markup=get_owner_keyboard()); return ConversationHandler.END
 
+async def ask_price(update, context):
+    await update.message.reply_text(st("Send new Premium Price:")); return ASK_PRICE
 async def save_price(update, context):
-    set_setting("premium_price", update.message.text)
-    await update.message.reply_text(st("Price Updated!"))
-    return ConversationHandler.END
+    set_setting("premium_price", update.message.text); await update.message.reply_text(st("Price Updated!"), reply_markup=get_owner_keyboard()); return ConversationHandler.END
 
+async def ask_welcome(update, context):
+    await update.message.reply_text(st("Send Welcome Image:")); return ASK_WELCOME
 async def save_welcome(update, context):
     if update.message.photo:
         set_setting("welcome_image", update.message.photo[-1].file_id)
-        await update.message.reply_text(st("Welcome Image Set!"))
+        await update.message.reply_text(st("Image Set!"), reply_markup=get_owner_keyboard())
     return ConversationHandler.END
 
+async def ask_gift(update, context):
+    await update.message.reply_text(st("Send User ID to gift premium:")); return ASK_GIFT_ID
 async def save_gift(update, context):
     uid = update.message.text
     db_execute("UPDATE users SET is_premium=1 WHERE user_id=?", (uid,))
-    await update.message.reply_text(f"{st('User')} {uid} {st('gifted premium!')}")
-    try: await context.bot.send_message(chat_id=uid, text=st("Admin gifted you Premium Access!"))
+    await update.message.reply_text(f"{st('Gifted premium to')} {uid}", reply_markup=get_owner_keyboard())
+    try: await context.bot.send_message(chat_id=uid, text=st("Admin gifted you Premium!"))
     except: pass
     return ConversationHandler.END
 
+async def ask_trails(update, context):
+    await update.message.reply_text(st("Send number of free trails (e.g. 1, 0):")); return ASK_TRAILS
 async def save_trails(update, context):
     trails = update.message.text
     db_execute("UPDATE users SET trails=?", (trails,))
-    await update.message.reply_text(f"{st('All users set to')} {trails} {st('trails.')}")
+    await update.message.reply_text(f"{st('All users set to')} {trails} {st('trails.')}", reply_markup=get_owner_keyboard())
     return ConversationHandler.END
 
-async def do_broadcast(update, context):
+async def ask_bcast(update, context):
+    await update.message.reply_text(st("Send message/photo to broadcast:")); return BCAST_TEXT
+async def do_bcast(update, context):
     users = db_execute("SELECT user_id FROM users")
     success = 0
     for u in users:
@@ -274,39 +237,69 @@ async def do_broadcast(update, context):
                 await context.bot.send_message(chat_id=u[0], text=update.message.text)
             success += 1
         except: pass
-    await update.message.reply_text(f"{st('Broadcast sent to')} {success} {st('users.')}")
+    await update.message.reply_text(f"{st('Broadcast sent to')} {success} {st('users.')}", reply_markup=get_owner_keyboard())
     return ConversationHandler.END
+
+# ================== SMS AUTO-VERIFY ==================
+async def group_sms_reader(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if not text: return
+    
+    amt_match = re.search(r'(?:Rs\.?|INR)\s*([0-9]+(?:\.[0-9]{1,2})?)', text)
+    txn_match = re.search(r'Txn ID:\s*([A-Za-z0-9]+)', text)
+    
+    if amt_match and txn_match:
+        amount = float(amt_match.group(1))
+        txn_id = txn_match.group(1)
+        pending = db_execute("SELECT id, user_id FROM payments WHERE status='PENDING' AND ABS(amount - ?) < 0.01", (amount,))
+        
+        if pending:
+            p_id, u_id = pending[0]
+            db_execute("UPDATE payments SET status='VERIFIED', txn_id=? WHERE id=?", (txn_id, p_id))
+            db_execute("UPDATE users SET is_premium=1 WHERE user_id=?", (u_id,))
+            try:
+                await context.bot.send_message(chat_id=u_id, text=f"<b>{st('Payment Verified! Now you are a premium user, get unlimited access now.')}</b>", parse_mode="HTML")
+            except: pass
+            await update.message.reply_text(f"Payment {amount} verified for user {u_id}.")
 
 # ================== MAIN ==================
 def main():
     threading.Thread(target=run_server, daemon=True).start()
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Handlers
     ban_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(f"^{st('BAN ACCOUNT')}$"), ban_account_btn)],
-        states={ASK_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_token)]},
-        fallbacks=[]
+        states={ASK_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_token)]}, fallbacks=[]
     )
 
     owner_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(owner_callbacks)],
+        entry_points=[
+            MessageHandler(filters.Regex(f"^{st('SET UPI')}$"), ask_upi),
+            MessageHandler(filters.Regex(f"^{st('SET PRICE')}$"), ask_price),
+            MessageHandler(filters.Regex(f"^{st('SET WELCOME')}$"), ask_welcome),
+            MessageHandler(filters.Regex(f"^{st('GIFT PREMIUM')}$"), ask_gift),
+            MessageHandler(filters.Regex(f"^{st('SET TRAILS')}$"), ask_trails),
+            MessageHandler(filters.Regex(f"^{st('BROADCAST')}$"), ask_bcast),
+        ],
         states={
             ASK_UPI: [MessageHandler(filters.TEXT, save_upi)],
             ASK_PRICE: [MessageHandler(filters.TEXT, save_price)],
             ASK_WELCOME: [MessageHandler(filters.PHOTO, save_welcome)],
             ASK_GIFT_ID: [MessageHandler(filters.TEXT, save_gift)],
             ASK_TRAILS: [MessageHandler(filters.TEXT, save_trails)],
-            BCAST_TEXT: [MessageHandler(filters.ALL, do_broadcast)],
-        },
-        fallbacks=[]
+            BCAST_TEXT: [MessageHandler(filters.ALL, do_bcast)],
+        }, fallbacks=[]
     )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(ban_conv)
     app.add_handler(owner_conv)
     app.add_handler(MessageHandler(filters.Regex(f"^{st('GET PREMIUM')}$"), premium_btn))
-    app.add_handler(MessageHandler(filters.Regex(f"^{st('OWNER PANEL')}$"), owner_panel))
-    
+    app.add_handler(MessageHandler(filters.Regex(f"^{st('OWNER PANEL')}$"), owner_panel_btn))
+    app.add_handler(MessageHandler(filters.Regex(f"^{st('STATS')}$"), owner_stats))
+    app.add_handler(MessageHandler(filters.Regex(f"^{st('MAIN MENU')}$"), main_menu_btn))
+    app.add_handler(CallbackQueryHandler(cancel_payment, pattern="^cancel_payment$"))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, group_sms_reader))
 
     logger.info("FF Ban Bot Started!")
